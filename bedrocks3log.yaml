@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda + API Gateway for Bedrock Knowledge Base Chat (Haiku + S3 Logging)
+
+Parameters:
+  KnowledgeBaseId:
+    Type: String
+    Description: Bedrock Knowledge Base ID (e.g., kb-XXXXXXXXXX)
+  ModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Bedrock Model ID (e.g., anthropic.claude-3-haiku-20240307-v1:0)
+  LogBucketName:
+    Type: String
+    Description: S3 bucket name for storing question logs
+  LogKey:
+    Type: String
+    Default: chatlog/chatlog.json
+    Description: S3 object key for storing chat logs
+
+Resources:
+  BedrockLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-chat-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${LogBucketName}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${LogBucketName}
+
+  BedrockLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bedrock-chat-handler-1
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          MODEL_ARN: !Ref ModelId
+          LOG_BUCKET: !Ref LogBucketName
+          LOG_KEY: !Ref LogKey
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          bedrock = boto3.client("bedrock-agent-runtime")
+          s3 = boto3.client("s3")
+
+          def save_log_to_s3(question, answer):
+              bucket = os.environ.get("LOG_BUCKET")
+              key = os.environ.get("LOG_KEY")
+              try:
+                  try:
+                      obj = s3.get_object(Bucket=bucket, Key=key)
+                      logs = json.loads(obj['Body'].read().decode('utf-8'))
+                  except s3.exceptions.NoSuchKey:
+                      logs = []
+                  logs.append({
+                      "timestamp": datetime.utcnow().isoformat(),
+                      "question": question,
+                      "answer": answer
+                  })
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps(logs, ensure_ascii=False, indent=2),
+                      ContentType='application/json'
+                  )
+              except Exception as e:
+                  print(f"???????: {e}")
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get("body", "{}"))
+                  question = body.get("question", "?????")
+                  response = bedrock.retrieve_and_generate(
+                      input={"text": question},
+                      retrieveAndGenerateConfiguration={
+                          "type": "KNOWLEDGE_BASE",
+                          "knowledgeBaseConfiguration": {
+                              "knowledgeBaseId": os.environ["KNOWLEDGE_BASE_ID"],
+                              "modelArn": os.environ["MODEL_ARN"]
+                          }
+                      }
+                  )
+                  answer = response["output"]["text"]
+                  save_log_to_s3(question, answer)
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST"
+                      },
+                      "body": json.dumps({"answer": answer})
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST"
+                      },
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  BedrockHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: bedrock-chat-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+
+  BedrockIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref BedrockHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockLambdaFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  BedrockRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref BedrockHttpApi
+      RouteKey: POST /chat
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref BedrockIntegration
+
+  BedrockStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref BedrockHttpApi
+      StageName: prod
+      AutoDeploy: true
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BedrockHttpApi}/*/*/chat
+
+Outputs:
+  ApiUrl:
+    Description: Invoke this endpoint with POST /chat
+    Value: !Sub https://${BedrockHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat
